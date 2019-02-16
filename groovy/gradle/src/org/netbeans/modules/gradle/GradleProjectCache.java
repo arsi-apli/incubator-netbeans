@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 package org.netbeans.modules.gradle;
 
 import org.netbeans.modules.gradle.spi.GradleFiles;
@@ -68,12 +67,17 @@ import org.netbeans.modules.gradle.api.NbGradleProject;
 import org.netbeans.modules.gradle.api.execute.GradleCommandLine;
 import java.util.WeakHashMap;
 import javax.swing.JLabel;
+import org.gradle.tooling.model.gradle.GradleBuild;
 import org.netbeans.modules.gradle.api.execute.RunUtils;
+import org.netbeans.modules.gradle.spi.GradleProjectProperty;
 import org.openide.awt.Notification;
 import org.openide.awt.NotificationDisplayer;
 
 import org.openide.awt.NotificationDisplayer.Category;
 import org.openide.awt.NotificationDisplayer.Priority;
+import org.openide.util.lookup.Lookups;
+import org.netbeans.modules.gradle.spi.ProjectInfoExtractorGradleModelsQuery;
+import org.openide.util.Exceptions;
 
 /**
  *
@@ -82,7 +86,9 @@ import org.openide.awt.NotificationDisplayer.Priority;
 @SuppressWarnings("rawtypes")
 public final class GradleProjectCache {
 
-    private enum GoOnline { NEVER, ON_DEMAND, ALWAYS }
+    private enum GoOnline {
+        NEVER, ON_DEMAND, ALWAYS
+    }
 
     private static final Logger LOG = Logger.getLogger(GradleProjectCache.class.getName());
     private static final String INFO_CACHE_FILE_NAME = "project-info.ser"; //NOI18N
@@ -96,9 +102,11 @@ public final class GradleProjectCache {
     private static final int COMPATIBLE_CACHE_VERSION = 10;
 
     /**
-     * Loads a physical GradleProject either from Gradle or Cache. As project retrieval can be time consuming using
-     * Gradle sometimes it's just enough to shoot for FALLBACK information. Aiming for FALLBACK quality either retrieves
-     * the GradleProject form cache if it's valid or returns the fallback Project implementation.
+     * Loads a physical GradleProject either from Gradle or Cache. As project
+     * retrieval can be time consuming using Gradle sometimes it's just enough
+     * to shoot for FALLBACK information. Aiming for FALLBACK quality either
+     * retrieves the GradleProject form cache if it's valid or returns the
+     * fallback Project implementation.
      *
      * @param files The project to load.
      * @param requestedQuality The project information quality to aim for.
@@ -113,15 +121,24 @@ public final class GradleProjectCache {
         GradleProject prev = project.project;
 
         ignoreCache |= GradleSettings.getDefault().isCacheDisabled();
-
+        final ReloadContext ctx = new ReloadContext(project, prev, aim);
         // Try to turn to the cache
-        if (!ignoreCache && (prev.getQuality() == FALLBACK))  {
+        if (!ignoreCache && (prev.getQuality() == FALLBACK)) {
             ProjectCacheEntry cacheEntry = loadCachedProject(files);
             if (cacheEntry != null) {
                 if (cacheEntry.isCompatible()) {
-                    prev = createGradleProject(cacheEntry.quality, cacheEntry.data);
                     if (cacheEntry.isValid(aim)) {
-                        return prev;
+                        try {
+                            GRADLE_LOADER_RP.submit(new ModelLoaderTask(ctx));
+                        } catch (Exception e) {
+                        }
+                        try {
+                            return GRADLE_LOADER_RP.submit(new CachedProjectLoaderTask(cacheEntry.quality, cacheEntry.data)).get();
+                        } catch (InterruptedException ex) {
+                            Exceptions.printStackTrace(ex);
+                        } catch (ExecutionException ex) {
+                            Exceptions.printStackTrace(ex);
+                        }
                     }
                 }
             }
@@ -131,11 +148,11 @@ public final class GradleProjectCache {
             prev = fallbackProject(project.getGradleFiles());
         }
 
-        final ReloadContext ctx = new ReloadContext(project, prev, aim);
         ctx.args = args;
 
         GradleProject ret;
         try {
+            GRADLE_LOADER_RP.submit(new ModelLoaderTask(ctx));
             ret = GRADLE_LOADER_RP.submit(new ProjectLoaderTask(ctx)).get();
         } catch (InterruptedException | ExecutionException ex) {
             ret = fallbackProject(files);
@@ -164,7 +181,6 @@ public final class GradleProjectCache {
         cmd.setStackTrace(GradleCommandLine.StackTrace.SHORT);
         cmd.addSystemProperty(GradleDaemon.PROP_TOOLING_JAR, TOOLING_JAR);
         cmd.addProjectProperty("nbSerializeCheck", "true");
-
 
         GoOnline goOnline;
         if (GradleSettings.getDefault().isOffline()) {
@@ -208,7 +224,7 @@ public final class GradleProjectCache {
             } else {
                 String problem = info.getGradleException();
                 String[] lines = problem.split("\n");
-                LOG.log(INFO, "Failed to retrieve project information for: {0} {1}", new Object[] {base.getProjectDir(), lines});
+                LOG.log(INFO, "Failed to retrieve project information for: {0} {1}", new Object[]{base.getProjectDir(), lines});
                 openNotification(base.getProjectDir(), Bundle.TIT_LOAD_FAILED(base.getProjectDir().getName()), lines[0], problem);
                 return ctx.previous.invalidate(problem);
             }
@@ -248,8 +264,85 @@ public final class GradleProjectCache {
         return ret;
     }
 
+    private static void loadGradleModels(ReloadContext ctx, CancellationToken token, ProgressListener pl) {
+        GradleBaseProject base = ctx.previous.getBaseProject();
+        GradleConnector gconn = GradleConnector.newConnector();
+        gconn.useInstallation(RunUtils.evaluateGradleDistribution(ctx.project, true));
+        ProjectConnection pconn = gconn.forProjectDirectory(base.getProjectDir()).connect();
+
+        GradleCommandLine cmd = new GradleCommandLine(ctx.args);
+        cmd.setFlag(GradleCommandLine.Flag.CONFIGURE_ON_DEMAND, GradleSettings.getDefault().isConfigureOnDemand());
+        cmd.addParameter(GradleCommandLine.Parameter.INIT_SCRIPT, INIT_SCRIPT);
+        cmd.setStackTrace(GradleCommandLine.StackTrace.SHORT);
+        cmd.addSystemProperty(GradleDaemon.PROP_TOOLING_JAR, TOOLING_JAR);
+        cmd.addProjectProperty("nbSerializeCheck", "true");
+        applyExtraProjectProperties(cmd);
+
+        Map<Class, Object> modelCache = new HashMap<>();
+        Collection<? extends ProjectInfoExtractor> extractors = Lookup.getDefault().lookupAll(ProjectInfoExtractor.class);
+        for (ProjectInfoExtractor extractor : extractors) {
+            if ((extractor instanceof ProjectInfoExtractorGradleModelsQuery) && ((ProjectInfoExtractorGradleModelsQuery) extractor).isSupported()) {
+                Class[] requestedModels = ((ProjectInfoExtractorGradleModelsQuery) extractor).getRequestedModels();
+                for (Class requestedModel : requestedModels) {
+                    Object model = modelCache.get(requestedModel);
+                    if (model == null) {
+                        try {
+                            model = retrieveModel(GoOnline.ALWAYS, pconn, cmd, token, pl);
+                        } catch (GradleConnectionException | IllegalStateException ex) {
+                            LOG.log(FINE, "Failed to retrieve model information for: " + base.getProjectDir(), ex);
+                            StringBuilder sb = new StringBuilder();
+                            Throwable th = ex;
+                            String separator = "";
+                            while (th != null) {
+                                sb.insert(0, separator);
+                                sb.insert(0, th.getMessage());
+                                th = th.getCause();
+                                separator = "<br/>";
+                            }
+                            openNotification(base.getProjectDir(), Bundle.TIT_LOAD_FAILED(base.getProjectDir()), ex.getMessage(), sb.toString());
+                        }
+                        modelCache.put(requestedModel, model);
+                    }
+                }
+            }
+        }
+        Lookup modelLookup = Lookups.fixed(modelCache.values().toArray());
+        for (ProjectInfoExtractor extractor : extractors) {
+            if ((extractor instanceof ProjectInfoExtractorGradleModelsQuery) && ((ProjectInfoExtractorGradleModelsQuery) extractor).isSupported()) {
+                ((ProjectInfoExtractorGradleModelsQuery) extractor).modelsLoaded(modelLookup);
+            }
+        }
+    }
+
+    private static void applyExtraProjectProperties(GradleCommandLine cmd) {
+        Collection<? extends ProjectInfoExtractor> extractors = Lookup.getDefault().lookupAll(ProjectInfoExtractor.class);
+        for (ProjectInfoExtractor extractor : extractors) {
+            if (extractor instanceof ProjectInfoExtractorGradleModelsQuery) {
+                GradleProjectProperty[] extraGradleArguments = ((ProjectInfoExtractorGradleModelsQuery) extractor).getExtraGradleProjectProperties();
+                for (int i = 0; i < extraGradleArguments.length; i++) {
+                    GradleProjectProperty extraGradleArgument = extraGradleArguments[i];
+                    cmd.addProjectProperty(extraGradleArgument.getName(), extraGradleArgument.getValue());
+                }
+            }
+        }
+    }
+
     private static BuildActionExecuter<NbProjectInfo> createInfoAction(ProjectConnection pconn, GradleCommandLine cmd, CancellationToken token, ProgressListener pl) {
         BuildActionExecuter<NbProjectInfo> ret = pconn.action(new NbProjectInfoAction());
+        cmd.configure(ret);
+
+        if (token != null) {
+            ret.withCancellationToken(token);
+        }
+
+        if (pl != null) {
+            ret.addProgressListener(pl);
+        }
+        return ret;
+    }
+
+    private static BuildActionExecuter<Object> createModelAction(ProjectConnection pconn, GradleCommandLine cmd, CancellationToken token, ProgressListener pl) {
+        BuildActionExecuter<Object> ret = pconn.action(new RetreiveModelAction(GradleBuild.class));
         cmd.configure(ret);
 
         if (token != null) {
@@ -299,11 +392,59 @@ public final class GradleProjectCache {
         return ret;
     }
 
+    private static Object retrieveModel(GoOnline goOnline, ProjectConnection pconn, GradleCommandLine cmd, CancellationToken token, ProgressListener pl) throws GradleConnectionException, IllegalStateException {
+        Object ret;
+
+        GradleSettings settings = GradleSettings.getDefault();
+
+        GradleCommandLine online = new GradleCommandLine(cmd);
+        GradleCommandLine offline = new GradleCommandLine(cmd);
+
+        if (goOnline != GoOnline.ALWAYS) {
+            if (settings.getDownloadSources() == GradleSettings.DownloadMiscRule.ALWAYS) {
+                //online.addProjectProperty("downloadSources", "ALL"); //NOI18N
+            }
+            if (settings.getDownloadJavadoc() == GradleSettings.DownloadMiscRule.ALWAYS) {
+                //online.addProjectProperty("downloadJavadoc", "ALL"); //NOI18N
+            }
+            offline.addFlag(GradleCommandLine.Flag.OFFLINE);
+        }
+
+        if (goOnline == GoOnline.NEVER || goOnline == GoOnline.ON_DEMAND) {
+            BuildActionExecuter<Object> action = createModelAction(pconn, offline, token, pl);
+            try {
+                ret = action.run();
+            } catch (GradleConnectionException | IllegalStateException ex) {
+                if (goOnline == GoOnline.NEVER) {
+                    throw ex;
+                }
+            }
+        }
+
+        BuildActionExecuter<Object> action = createModelAction(pconn, offline, token, pl);
+        ret = action.run();
+        return ret;
+    }
+
     private static class NbProjectInfoAction implements Serializable, BuildAction<NbProjectInfo> {
 
         @Override
         public NbProjectInfo execute(BuildController bc) {
             return bc.getModel(NbProjectInfo.class);
+        }
+    }
+
+    private static class RetreiveModelAction implements Serializable, BuildAction<Object> {
+
+        private final Class modelClass;
+
+        public RetreiveModelAction(Class modelClass) {
+            this.modelClass = modelClass;
+        }
+
+        @Override
+        public Object execute(BuildController bc) {
+            return bc.getModel(modelClass);
         }
     }
 
@@ -330,6 +471,68 @@ public final class GradleProjectCache {
             handle.start();
             try {
                 return loadGradleProject(ctx, tokenSource.token(), pl);
+            } catch (Throwable ex) {
+                LOG.log(WARNING, ex.getMessage(), ex);
+                throw ex;
+            } finally {
+                handle.finish();
+            }
+        }
+
+        @Override
+        public boolean cancel() {
+            if (tokenSource != null) {
+                tokenSource.cancel();
+            }
+            return true;
+        }
+
+    }
+    
+    private static class CachedProjectLoaderTask implements Callable<GradleProject>, Cancellable {
+
+        private final Quality quality;
+        private final NbProjectInfo info;
+
+        public CachedProjectLoaderTask(Quality quality, NbProjectInfo info) {
+            this.quality = quality;
+            this.info = info;
+        }
+
+
+        @Override
+        public GradleProject call() throws Exception {
+            return createGradleProject(quality, info);
+        }
+
+        @Override
+        public boolean cancel() {
+            return false;
+        }
+
+
+    }
+
+    private static class ModelLoaderTask implements Callable<Object>, Cancellable {
+
+        private final ReloadContext ctx;
+        private CancellationTokenSource tokenSource;
+
+        public ModelLoaderTask(ReloadContext ctx) {
+            this.ctx = ctx;
+        }
+
+        @Override
+        public Object call() throws Exception {
+            tokenSource = GradleConnector.newCancellationTokenSource();
+            final ProgressHandle handle = ProgressHandle.createHandle(Bundle.LBL_Loading(ctx.previous.getBaseProject().getName()), this);
+            ProgressListener pl = (ProgressEvent pe) -> {
+                handle.progress(pe.getDescription());
+            };
+            handle.start();
+            try {
+                loadGradleModels(ctx, tokenSource.token(), pl);
+                return null;
             } catch (Throwable ex) {
                 LOG.log(WARNING, ex.getMessage(), ex);
                 throw ex;
@@ -482,6 +685,7 @@ public final class GradleProjectCache {
     }
 
     static final class ReloadContext {
+
         final NbGradleProjectImpl project;
         final GradleProject previous;
         final Quality aim;

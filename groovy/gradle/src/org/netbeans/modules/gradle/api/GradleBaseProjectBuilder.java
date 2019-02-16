@@ -122,12 +122,19 @@ class GradleBaseProjectBuilder implements ProjectInfoExtractor.Result {
         Set<File> sourceSetOutputs = new HashSet<>();
         Set<String> sourceSetNames = (Set<String>) info.get("sourcesets");
         if (sourceSetNames != null) {
-            for (String name : sourceSetNames) {
-                Set<File> dirs = (Set<File>) info.get("sourceset_" + name + "_output_classes");
-                sourceSetOutputs.addAll(dirs);
-                sourceSetOutputs.add((File) info.get("sourceset_" + name + "_output_resources"));
+                for (String name : sourceSetNames) {
+                    //bugfix nullpointer exception for Android project
+                    //there are used another names
+                    Set<File> dirs = (Set<File>) info.get("sourceset_" + name + "_output_classes");
+                    if (dirs!=null) {
+                        sourceSetOutputs.addAll(dirs);
+                    }
+                    File res = (File) info.get("sourceset_" + name + "_output_resources");
+                    if (res!=null) {
+                        sourceSetOutputs.add(res);
+                    }
+                }
             }
-        }
         prj.outputPaths = createSet(sourceSetOutputs);
 
         Set<String> configurationNames = createSet((Set<String>) info.get("configurations"));
